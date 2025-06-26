@@ -1,0 +1,107 @@
+<?php
+session_start();
+require_once '../../config/database.php';
+
+// Check if user is logged in
+if (!isset($_SESSION['user_id'])) {
+    http_response_code(403);
+    echo json_encode(['success' => false, 'message' => 'Accès non autorisé']);
+    exit();
+}
+
+// Check if request is POST
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['success' => false, 'message' => 'Méthode non autorisée']);
+    exit();
+}
+
+// Get JSON input
+$input = json_decode(file_get_contents('php://input'), true);
+
+if (!isset($input['delivery_id']) || !is_numeric($input['delivery_id'])) {
+    http_response_code(400);
+    echo json_encode(['success' => false, 'message' => 'ID livraison invalide']);
+    exit();
+}
+
+$deliveryId = (int)$input['delivery_id'];
+$userId = $_SESSION['user_id'];
+$userType = $_SESSION['user_type'];
+
+try {
+    // Get delivery info and verify ownership
+    $stmt = $conn->prepare("
+        SELECT c.id_Commande, c.statu, c.id_Client, c.id_Livreur, c.adresse_livraison, c.prix_suggere
+        FROM commande c
+        WHERE c.id_Commande = ? AND (c.id_Client = ? OR c.id_Livreur = ?)
+    ");
+    $stmt->bind_param("iii", $deliveryId, $userId, $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows === 0) {
+        echo json_encode(['success' => false, 'message' => 'Livraison non trouvée ou accès non autorisé']);
+        exit();
+    }
+
+    $delivery = $result->fetch_assoc();
+    $stmt->close();
+
+    // Check if delivery can be cancelled
+    if ($delivery['statu'] === 'cancelled') {
+        echo json_encode(['success' => false, 'message' => 'Cette livraison est déjà annulée']);
+        exit();
+    }
+
+    if ($delivery['statu'] === 'delivered') {
+        echo json_encode(['success' => false, 'message' => 'Impossible d\'annuler une livraison déjà terminée']);
+        exit();
+    }
+
+    // Only client can cancel pending deliveries, both can cancel accepted deliveries
+    if ($delivery['statu'] === 'pending' && $delivery['id_Client'] !== $userId) {
+        echo json_encode(['success' => false, 'message' => 'Seul le client peut annuler une livraison en attente']);
+        exit();
+    }
+
+    // If transporter is cancelling, check if it's not too late
+    if ($userType === 'livreur' && in_array($delivery['statu'], ['picked_up'])) {
+        echo json_encode(['success' => false, 'message' => 'Impossible d\'annuler une livraison déjà en cours']);
+        exit();
+    }
+
+    // Update delivery status
+    $stmt = $conn->prepare("UPDATE commande SET statu = 'cancelled' WHERE id_Commande = ?");
+    $stmt->bind_param("i", $deliveryId);
+
+    if ($stmt->execute()) {
+        $stmt->close();
+
+        // If transporter was assigned, remove assignment and reject all propositions
+        if ($delivery['id_Livreur']) {
+            $stmt = $conn->prepare("UPDATE commande SET id_Livreur = NULL WHERE id_Commande = ?");
+            $stmt->bind_param("i", $deliveryId);
+            $stmt->execute();
+            $stmt->close();
+
+            // Reject all propositions for this delivery
+            $stmt = $conn->prepare("UPDATE proposition SET statut = 'rejected' WHERE id_Commande = ?");
+            $stmt->bind_param("i", $deliveryId);
+            $stmt->execute();
+            $stmt->close();
+        }
+
+        echo json_encode([
+            'success' => true,
+            'message' => 'Livraison annulée avec succès'
+        ]);
+    } else {
+        echo json_encode(['success' => false, 'message' => 'Erreur lors de l\'annulation']);
+    }
+    
+} catch (Exception $e) {
+    error_log("Error in cancel_delivery.php: " . $e->getMessage());
+    echo json_encode(['success' => false, 'message' => 'Erreur interne du serveur']);
+}
+?>
